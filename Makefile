@@ -1,18 +1,15 @@
-CXX = g++
+CXX      = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -pthread
 
-TARGET = thread_pool_demo
-SOURCES = main.cpp ThreadPool.cpp
+all: demo
 
-all: $(TARGET)
+demo: main.cpp ThreadPool.cpp ThreadPool.h
+	$(CXX) $(CXXFLAGS) main.cpp ThreadPool.cpp -o demo
 
-$(TARGET): $(SOURCES) ThreadPool.h
-	$(CXX) $(CXXFLAGS) $(SOURCES) -o $(TARGET)
-
-run: $(TARGET)
-	./$(TARGET)
+run: demo
+	./demo
 
 clean:
-	rm -f $(TARGET)
+	rm -f demo demo.exe
 
 .PHONY: all run clean

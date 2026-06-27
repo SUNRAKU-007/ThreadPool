@@ -1,41 +1,48 @@
 #include "ThreadPool.h"
-#include <iostream>
 
-ThreadPool::ThreadPool(size_t numThreads) : stop(false) {
+ThreadPool::ThreadPool(size_t numThreads, size_t maxQueueSize, bool enableLogging)
+    : stop(false), maxQueueSize(maxQueueSize), completed(0), logging(enableLogging)
+{
     for (size_t i = 0; i < numThreads; ++i) {
-        // Each worker is a thread running workerLoop().
-        workers.emplace_back([this] { this->workerLoop(); });
+        // Pass worker ID so logging can identify each thread
+        workers.emplace_back([this, i] { this->workerLoop(static_cast<int>(i)); });
     }
 }
 
-void ThreadPool::workerLoop() {
+void ThreadPool::workerLoop(int workerId) {
     while (true) {
-        std::function<void()> task;
+        Task task;
 
         {
-            // unique_lock (not lock_guard) because condition_variable
-            // needs to be able to unlock/relock it internally while waiting.
             std::unique_lock<std::mutex> lock(queueMutex);
 
-            // Sleep until there's a task OR we've been told to stop.
-            // The lambda guards against "spurious wakeups" (the OS waking
-            // a thread for no reason) — we re-check the condition on wake.
-            condition.wait(lock, [this] {
+            taskAvailable.wait(lock, [this] {
                 return stop || !tasks.empty();
             });
 
-            // If we're stopping AND the queue is drained, exit the loop.
-            if (stop && tasks.empty()) {
-                return;
-            }
+            if (stop && tasks.empty()) return;
 
-            task = std::move(tasks.front());
+            // priority_queue gives us the highest priority task at .top()
+            task = tasks.top();
             tasks.pop();
-        } // lock released here, BEFORE we run the task —
-          // otherwise no other worker could touch the queue while
-          // this task is running, defeating the point of a pool.
 
-        task();
+            // Tell submit() a slot just opened — it may be waiting
+            if (maxQueueSize > 0) {
+                slotAvailable.notify_one();
+            }
+        }
+
+        // LOGGING: show which worker picked up this task
+        if (logging) {
+            std::lock_guard<std::mutex> coutLock(queueMutex);
+            std::cout << "[Worker " << workerId
+                      << " | Thread " << std::this_thread::get_id()
+                      << " | Priority " << task.priority
+                      << "] picked up a task\n";
+        }
+
+        task.fn();
+        completed++;
     }
 }
 
@@ -49,12 +56,10 @@ ThreadPool::~ThreadPool() {
         std::lock_guard<std::mutex> lock(queueMutex);
         stop = true;
     }
+    taskAvailable.notify_all();
+    slotAvailable.notify_all();
 
-    // Wake up EVERY worker (not just one) so they all notice `stop`
-    // and can exit their loop.
-    condition.notify_all();
-
-    for (std::thread& worker : workers) {
-        worker.join(); // wait for each thread to actually finish
+    for (std::thread& w : workers) {
+        w.join();
     }
 }

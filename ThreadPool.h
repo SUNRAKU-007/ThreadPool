@@ -9,75 +9,111 @@
 #include <functional>
 #include <future>
 #include <stdexcept>
+#include <atomic>
+#include <iostream>
 
-// A simple, fixed-size thread pool.
+// ============================================================
+// UPGRADED THREAD POOL — All README challenges solved
 //
-// HOW IT WORKS (read this before reading the code):
-// 1. The constructor spawns `numThreads` worker threads. Each one runs
-//    `workerLoop()` forever, waiting for tasks to show up in the queue.
-// 2. `submit()` puts a task into the queue and wakes ONE sleeping worker.
-// 3. A worker wakes up, grabs the task off the queue, runs it, then goes
-//    back to waiting.
-// 4. The destructor sets a "stop" flag and wakes everyone up so they can
-//    exit their loop cleanly instead of hanging forever.
-//
-// The tricky part is always synchronization: many threads touch the same
-// queue, so every access to it must be protected by `queueMutex`.
+// NEW vs original:
+//  1. size()              — how many worker threads exist
+//  2. completedTasks()    — how many tasks finished
+//  3. Thread logging      — see which worker picks what task
+//  4. Priority queue      — high priority tasks run first
+//                           use submitWithPriority(p, fn, args...)
+//  5. Bounded queue       — submit() blocks when queue is full
+// ============================================================
+
+struct Task {
+    int priority;
+    std::function<void()> fn;
+
+    // MAX-heap: higher priority number runs first
+    bool operator<(const Task& other) const {
+        return priority < other.priority;
+    }
+};
 
 class ThreadPool {
 public:
-    explicit ThreadPool(size_t numThreads);
+    // numThreads   : worker thread count
+    // maxQueueSize : 0 = unlimited, >0 = blocks submit() when full
+    // enableLogging: print which worker picks up each task
+    explicit ThreadPool(size_t numThreads,
+                        size_t maxQueueSize = 0,
+                        bool enableLogging = false);
     ~ThreadPool();
 
-    // Submit a task and get back a future you can call .get() on to
-    // retrieve the result (or block until the task finishes).
+    // Normal submit — priority 0 (FIFO among equal-priority tasks)
     template<class F, class... Args>
-    auto submit(F&& f, Args&&... args) -> std::future<typename std::invoke_result<F, Args...>::type>;
+    auto submit(F&& f, Args&&... args)
+        -> std::future<typename std::invoke_result<F, Args...>::type>;
 
-    // Returns how many tasks are currently waiting (not yet started).
+    // Priority submit — higher number runs before lower
+    template<class F, class... Args>
+    auto submitWithPriority(int priority, F&& f, Args&&... args)
+        -> std::future<typename std::invoke_result<F, Args...>::type>;
+
+    size_t size()           const { return workers.size(); }
     size_t pendingTasks();
+    size_t completedTasks() const { return completed.load(); }
+    void   setLogging(bool on)    { logging = on; }
 
 private:
-    void workerLoop();
+    void workerLoop(int workerId);
 
-    std::vector<std::thread> workers;
-    std::queue<std::function<void()>> tasks;
+    template<class F, class... Args>
+    auto submitImpl(int priority, F&& f, Args&&... args)
+        -> std::future<typename std::invoke_result<F, Args...>::type>;
 
-    std::mutex queueMutex;
-    std::condition_variable condition;
-    bool stop;
+    std::vector<std::thread>       workers;
+    std::priority_queue<Task>      tasks;
+    std::mutex                     queueMutex;
+    std::condition_variable        taskAvailable;
+    std::condition_variable        slotAvailable;
+    bool                           stop;
+    size_t                         maxQueueSize;
+    std::atomic<size_t>            completed;
+    bool                           logging;
 };
 
-// --- Template method must live in the header (C++ requirement) ---
+// ── submitImpl (shared logic) ────────────────────────────────
+template<class F, class... Args>
+auto ThreadPool::submitImpl(int priority, F&& f, Args&&... args)
+    -> std::future<typename std::invoke_result<F, Args...>::type>
+{
+    using R = typename std::invoke_result<F, Args...>::type;
+    auto taskPtr = std::make_shared<std::packaged_task<R()>>(
+        std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+    );
+    std::future<R> result = taskPtr->get_future();
+    {
+        std::unique_lock<std::mutex> lock(queueMutex);
+        if (stop) throw std::runtime_error("submit() on stopped pool");
+        if (maxQueueSize > 0) {
+            slotAvailable.wait(lock, [this] {
+                return stop || tasks.size() < maxQueueSize;
+            });
+        }
+        if (stop) throw std::runtime_error("submit() on stopped pool");
+        tasks.push({ priority, [taskPtr]() { (*taskPtr)(); } });
+    }
+    taskAvailable.notify_one();
+    return result;
+}
 
 template<class F, class... Args>
 auto ThreadPool::submit(F&& f, Args&&... args)
     -> std::future<typename std::invoke_result<F, Args...>::type>
 {
-    using ReturnType = typename std::invoke_result<F, Args...>::type;
-
-    // package_task wraps the function so we can attach a future to it
-    auto task = std::make_shared<std::packaged_task<ReturnType()>>(
-        std::bind(std::forward<F>(f), std::forward<Args>(args)...)
-    );
-
-    std::future<ReturnType> result = task->get_future();
-
-    {
-        std::lock_guard<std::mutex> lock(queueMutex);
-
-        if (stop) {
-            throw std::runtime_error("submit() called on a stopped ThreadPool");
-        }
-
-        // Wrap the packaged_task in a plain void() lambda so it fits in
-        // our std::function<void()> queue.
-        tasks.emplace([task]() { (*task)(); });
-    }
-
-    // Wake up exactly one worker — only one new task is available.
-    condition.notify_one();
-    return result;
+    return submitImpl(0, std::forward<F>(f), std::forward<Args>(args)...);
 }
 
-#endif // THREAD_POOL_H
+template<class F, class... Args>
+auto ThreadPool::submitWithPriority(int priority, F&& f, Args&&... args)
+    -> std::future<typename std::invoke_result<F, Args...>::type>
+{
+    return submitImpl(priority, std::forward<F>(f), std::forward<Args>(args)...);
+}
+
+#endif
